@@ -141,16 +141,41 @@ class RustDetector:
         print("Stage 5: Calculating severity...")
         severity_metrics = self.calculate_rust_severity(rust_mask, rail_mask_refined)
         
+        # Generate intermediate processing images
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, binary_mask = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
+        
+        # Texture analysis
+        kernel = np.ones((5,5), np.float32) / 25
+        smooth = cv2.filter2D(gray, -1, kernel)
+        texture_diff = cv2.absdiff(gray, smooth)
+        _, low_texture = cv2.threshold(texture_diff, 15, 255, cv2.THRESH_BINARY_INV)
+        
+        # Edge detection
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # HSV analysis
+        hsv = cv2.cvtColor(rail_only, cv2.COLOR_BGR2HSV)
+        
+        # Morphological operations
+        kernel_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        opened = cv2.morphologyEx(rail_mask_refined * 255, cv2.MORPH_OPEN, kernel_morph)
+        
         return {
             "original_image": image,
+            "binary_mask": binary_mask,
+            "texture_mask": low_texture,
+            "edges": edges,
             "rail_mask": rail_mask_refined,
+            "morphological": opened,
             "rail_only": rail_only,
+            "hsv_image": hsv,
             "rust_mask": rust_mask,
             "metrics": severity_metrics
         }
     
     def visualize_results(self, results: Dict, save_path: str = None):
-        """Visualize detection results"""
+        """Visualize detection results with green rail lines"""
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         
         # Original image
@@ -173,11 +198,20 @@ class RustDetector:
         axes[1, 0].set_title("Rust Detection")
         axes[1, 0].axis('off')
         
-        # Overlay
+        # Overlay with green rail lines and red rust
         overlay = results["original_image"].copy()
-        overlay[results["rust_mask"] == 1] = [0, 0, 255]  # Red for rust
+        
+        # Draw green lines for detected rails
+        rail_contours, _ = cv2.findContours(results["rail_mask"], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in rail_contours:
+            if cv2.contourArea(contour) > 1000:  # Only draw significant rail areas
+                cv2.drawContours(overlay, [contour], -1, (0, 255, 0), 3)  # Green outline
+        
+        # Highlight rust areas in red
+        overlay[results["rust_mask"] == 1] = [0, 0, 255]
+        
         axes[1, 1].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-        axes[1, 1].set_title("Rust Overlay")
+        axes[1, 1].set_title("Green=Rails, Red=Rust")
         axes[1, 1].axis('off')
         
         # Metrics

@@ -58,18 +58,49 @@ class RustDetector:
         ])
     
     def segment_rails(self, image: np.ndarray) -> np.ndarray:
-        """Stage 1: Segment rails from background using semantic segmentation"""
-        # Convert to PIL for transforms
-        pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        input_tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
+        """Stage 1: Advanced metal detection - isolate only rail metal surfaces"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        with torch.no_grad():
-            output = self.rail_model(input_tensor)
-            rail_mask = output[0, 1].cpu().numpy()  # Get rail class
+        # Metal detection using texture and intensity
+        # Rails are typically darker, smoother, and more uniform than ballast
         
-        # Resize back to original size
-        rail_mask = cv2.resize(rail_mask, (image.shape[1], image.shape[0]))
-        return (rail_mask > 0.5).astype(np.uint8)
+        # 1. Intensity-based filtering (rails are darker)
+        _, dark_regions = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
+        
+        # 2. Texture analysis - rails have less texture variation
+        kernel = np.ones((5,5), np.float32) / 25
+        smooth = cv2.filter2D(gray, -1, kernel)
+        texture_diff = cv2.absdiff(gray, smooth)
+        _, low_texture = cv2.threshold(texture_diff, 15, 255, cv2.THRESH_BINARY_INV)
+        
+        # 3. Edge-based rail detection
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # Detect long straight lines (rail edges)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=50, maxLineGap=10)
+        line_mask = np.zeros_like(gray)
+        
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                # Only keep near-vertical or near-horizontal lines (rail orientation)
+                angle = np.abs(np.arctan2(y2-y1, x2-x1) * 180 / np.pi)
+                if angle < 30 or angle > 150:  # Vertical-ish lines
+                    cv2.line(line_mask, (x1, y1), (x2, y2), 255, 8)
+        
+        # 4. Combine all metal detection criteria
+        metal_mask = cv2.bitwise_and(dark_regions, low_texture)
+        metal_mask = cv2.bitwise_and(metal_mask, cv2.dilate(line_mask, np.ones((5,5), np.uint8)))
+        
+        # 5. Morphological operations to clean up
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 15))
+        metal_mask = cv2.morphologyEx(metal_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Remove small objects (pebbles, noise)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        metal_mask = cv2.morphologyEx(metal_mask, cv2.MORPH_OPEN, kernel)
+        
+        return (metal_mask > 0).astype(np.uint8)
     
     def refine_rail_mask(self, mask: np.ndarray) -> np.ndarray:
         """Stage 2: Refine rail mask using morphological operations"""
@@ -171,16 +202,41 @@ class RustDetector:
         print("Stage 5: Calculating severity...")
         severity_metrics = self.calculate_rust_severity(rust_mask, rail_mask_refined)
         
+        # Generate intermediate processing images
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, binary_mask = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
+        
+        # Texture analysis
+        kernel = np.ones((5,5), np.float32) / 25
+        smooth = cv2.filter2D(gray, -1, kernel)
+        texture_diff = cv2.absdiff(gray, smooth)
+        _, low_texture = cv2.threshold(texture_diff, 15, 255, cv2.THRESH_BINARY_INV)
+        
+        # Edge detection
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # HSV analysis
+        hsv = cv2.cvtColor(rail_only, cv2.COLOR_BGR2HSV)
+        
+        # Morphological operations
+        kernel_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        opened = cv2.morphologyEx(rail_mask_refined * 255, cv2.MORPH_OPEN, kernel_morph)
+        
         return {
             "original_image": image,
+            "binary_mask": binary_mask,
+            "texture_mask": low_texture,
+            "edges": edges,
             "rail_mask": rail_mask_refined,
+            "morphological": opened,
             "rail_only": rail_only,
+            "hsv_image": hsv,
             "rust_mask": rust_mask,
             "metrics": severity_metrics
         }
     
     def visualize_results(self, results: Dict, save_path: str = None):
-        """Visualize detection results"""
+        """Visualize detection results with green rail lines"""
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         
         # Original image
@@ -203,11 +259,20 @@ class RustDetector:
         axes[1, 0].set_title("Rust Detection")
         axes[1, 0].axis('off')
         
-        # Overlay
+        # Overlay with green rail lines and red rust
         overlay = results["original_image"].copy()
-        overlay[results["rust_mask"] == 1] = [0, 0, 255]  # Red for rust
+        
+        # Draw green lines for detected rails
+        rail_contours, _ = cv2.findContours(results["rail_mask"], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in rail_contours:
+            if cv2.contourArea(contour) > 1000:  # Only draw significant rail areas
+                cv2.drawContours(overlay, [contour], -1, (0, 255, 0), 3)  # Green outline
+        
+        # Highlight rust areas in red
+        overlay[results["rust_mask"] == 1] = [0, 0, 255]
+        
         axes[1, 1].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-        axes[1, 1].set_title("Rust Overlay")
+        axes[1, 1].set_title("Green=Rails, Red=Rust")
         axes[1, 1].axis('off')
         
         # Metrics
